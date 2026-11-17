@@ -91,7 +91,8 @@ class LIRecord:
 @dataclass
 class Value:
     name: str
-    value: Union[str, int, bytes, dt.datetime]
+    # None when is_corrupted is True: the value is present but its data could not be read
+    value: Optional[Union[str, int, bytes, dt.datetime]]
     value_type: str
     is_corrupted: bool = False
 
@@ -482,9 +483,11 @@ class NKRecord:
         :param vk: A parse VK record
         :param stream: The registry stream
         :return: A VKRecord
+        :raises RegistryParsingException: If a non-resident value declares a data
+                 location outside of the hive, or the hive is too short to hold it
         """
-        stream.seek(REGF_HEADER_SIZE + 4 + vk.data_offset)
         data_type = vk.data_type
+        is_resident = vk.data_size >= 0x80000000
         # Resident values (data_size >= 0x80000000) store their data inline in the
         # data_offset field and have no out-of-line data cell. For the types whose
         # resident branches in iter_values rebuild the value from data_offset, the
@@ -497,10 +500,28 @@ class NKRecord:
         # iter_values reassigns to the non-resident-checked REG_SZ branch) all
         # consume this buffer even for resident-flagged values, and their output
         # must stay byte-identical to earlier versions and to the Rust backend.
-        if vk.data_size >= 0x80000000 and int(data_type) in _RESIDENT_SAFE_TYPES:
+        if is_resident and int(data_type) in _RESIDENT_SAFE_TYPES:
             data = b""
         else:
+            data_offset = REGF_HEADER_SIZE + 4 + vk.data_offset
+            file_size = stream.seek(0, 2)
+            # Non-resident values point at an out-of-line data cell. The declared
+            # offset and size come from the hive and may be corrupt: validate them
+            # against the hive size instead of letting a wild seek/read produce a
+            # raw StreamError downstream or, worse, a silently truncated value.
+            if not is_resident and vk.data_size:
+                if data_offset >= file_size or vk.data_size > file_size - data_offset:
+                    raise RegistryParsingException(
+                        f"Value data of size {vk.data_size} at data offset {hex(vk.data_offset)} "
+                        f"points outside of the hive (hive size: {file_size})"
+                    )
+            stream.seek(data_offset)
             data = stream.read(vk.data_size)
+            if not is_resident and len(data) != vk.data_size:
+                raise RegistryParsingException(
+                    f"Short read for value data at data offset {hex(vk.data_offset)}: "
+                    f"expected {vk.data_size} bytes, got {len(data)}"
+                )
         return VKRecord(
             value_type=data_type,
             value_type_str=str(data_type),
@@ -512,33 +533,52 @@ class NKRecord:
     def _parse_indirect_block(stream, value):
         # This is an indirect datablock (Bigger than 16344, therefor we handle it differently)
         # The value inside the vk entry actually contains a pointer to the buffers containing the data
-        big_data_block_header = BIG_DATA_BLOCK.parse(value.value)  # type: ignore[union-attr]
+        try:
+            big_data_block_header = BIG_DATA_BLOCK.parse(value.value)  # type: ignore[union-attr]
+        except (ConstError, StreamError) as ex:
+            raise RegistryParsingException(f"Bad indirect data block header: {ex}")
 
         # Go to the start of the segment offset list (+4 skips the cell size header)
         segment_list_offset = REGF_HEADER_SIZE + 4 + big_data_block_header.offset_to_list_of_segments
-        stream.seek(segment_list_offset)
-        buffer = BytesIO()
 
         # The value size (vk.data_size) and the segment offsets both come from the hive and may be
         # corrupt. A crafted hive could declare up to 0x7FFFFFFF bytes and repeat segment offsets,
         # exhausting memory. The reassembled value cannot be bigger than the hive itself, and the
         # number of segments is bounded by the db block header, so we honor both bounds.
         file_size = stream.seek(0, 2)
+        if segment_list_offset >= file_size:
+            raise RegistryParsingException(
+                f"Segment list of an indirect data block at {hex(big_data_block_header.offset_to_list_of_segments)} "
+                f"points outside of the hive (hive size: {file_size})"
+            )
         stream.seek(segment_list_offset)
+        buffer = BytesIO()
         value_size = min(value.size, file_size)
         for _ in range(big_data_block_header.number_of_segments):
             if value_size <= 0:
                 break
-            data_segment_offset = Int32ul.parse_stream(stream)  # type: ignore[union-attr]
+            try:
+                data_segment_offset = Int32ul.parse_stream(stream)  # type: ignore[union-attr]
+            except StreamError as ex:
+                raise RegistryParsingException(f"Truncated segment list of an indirect data block: {ex}")
             data_segment_position = REGF_HEADER_SIZE + 4 + data_segment_offset
             if data_segment_position >= file_size:
                 # Segment points outside of the hive - corrupted or crafted db block
-                break
+                raise RegistryParsingException(
+                    f"Segment of an indirect data block at {hex(data_segment_offset)} "
+                    f"points outside of the hive (hive size: {file_size})"
+                )
             with boomerang_stream(stream) as tmpstream:
                 tmpstream.seek(data_segment_position)
                 tmpbuffer = tmpstream.read(min(0x3FD8, value_size, file_size - data_segment_position))
                 value_size -= len(tmpbuffer)
                 buffer.write(tmpbuffer)
+        if value_size > 0:
+            # The declared segments did not cover the declared value size - returning the
+            # partial buffer here would silently produce a wrong value.
+            raise RegistryParsingException(
+                f"Indirect data block is truncated: {value_size} declared bytes are not covered by its segments"
+            )
         buffer.seek(0)
         return buffer.read()
 
@@ -571,10 +611,11 @@ class NKRecord:
                 try:
                     vk = VALUE_KEY.parse_stream(substream)  # type: ignore[union-attr]
                 except (ConstError, StreamError):
-                    logger.error(f"Could not parse VK at {substream.tell()}, registry hive is probably corrupted.")
-                    return
-
-                value = self.read_value(vk, substream)
+                    # The VK record itself is unreadable - there is no name or type to
+                    # report, so skip it explicitly and keep iterating the rest of the
+                    # values instead of aborting the whole subkey.
+                    logger.error(f"Could not parse VK at {substream.tell()}, registry hive is probably corrupted. Skipping it.")
+                    continue
 
                 if vk.name_size == 0:
                     value_name = "(default)"
@@ -604,23 +645,32 @@ class NKRecord:
                 else:
                     data_type = str(vk.data_type)
 
-                if data_type in ["REG_SZ", "REG_EXPAND", "REG_EXPAND_SZ"]:
-                    if vk.data_size >= 0x80000000:
-                        # data is stored inline, in the data_offset field itself
-                        inline_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]
-                        actual_value = try_decode_binary(inline_data, as_json=as_json, trim_values=trim_values)
-                    elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
-                        data = self._parse_indirect_block(substream, value)
-                        actual_value = try_decode_binary(data, as_json=as_json, trim_values=trim_values)
-                    else:
-                        actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
-                elif data_type in ["REG_BINARY", "REG_NONE"]:
-                    if vk.data_size >= 0x80000000:
-                        # data is stored inline, in the data_offset field itself
-                        inline_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]
-                        actual_value = binascii.b2a_hex(inline_data).decode()[:max_len] if trim_values else inline_data
-                    elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
-                        try:
+                # A single corrupted value must not poison the iteration of the rest of
+                # the subkey. Corruption surfaces either as a RegistryParsingException
+                # from the boundary checks in read_value/_parse_indirect_block, or as a
+                # raw construct/decode error from a type-specific branch. Either way the
+                # value is yielded with is_corrupted=True (and no data) so consumers can
+                # tell "present but unreadable" apart from "absent", and iteration moves
+                # on to the next value.
+                try:
+                    value = self.read_value(vk, substream)
+
+                    if data_type in ["REG_SZ", "REG_EXPAND", "REG_EXPAND_SZ"]:
+                        if vk.data_size >= 0x80000000:
+                            # data is stored inline, in the data_offset field itself
+                            inline_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]
+                            actual_value = try_decode_binary(inline_data, as_json=as_json, trim_values=trim_values)
+                        elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
+                            data = self._parse_indirect_block(substream, value)
+                            actual_value = try_decode_binary(data, as_json=as_json, trim_values=trim_values)
+                        else:
+                            actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
+                    elif data_type in ["REG_BINARY", "REG_NONE"]:
+                        if vk.data_size >= 0x80000000:
+                            # data is stored inline, in the data_offset field itself
+                            inline_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]
+                            actual_value = binascii.b2a_hex(inline_data).decode()[:max_len] if trim_values else inline_data
+                        elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
                             actual_value = self._parse_indirect_block(substream, value)
 
                             actual_value = (
@@ -628,43 +678,49 @@ class NKRecord:
                                 if as_json
                                 else actual_value
                             )
-                        except ConstError:
-                            logger.error(f"Bad value at {actual_vk_offset}")
-                            continue
-                    else:
-                        # Return the actual data
+                        else:
+                            # Return the actual data
+                            actual_value = binascii.b2a_hex(value.value).decode()[:max_len] if trim_values else value.value
+                    elif data_type == "REG_SZ":
+                        actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
+                    elif data_type == "REG_DWORD":
+                        # If the data size is bigger than 0x80000000, data is actually stored in the VK data offset.
+                        actual_value = vk.data_offset if vk.data_size >= 0x80000000 else Int32ul.parse(value.value)  # type: ignore[union-attr]
+                    elif data_type == "REG_QWORD":
+                        actual_value = vk.data_offset if vk.data_size >= 0x80000000 else Int64ul.parse(value.value)  # type: ignore[union-attr]
+                    elif data_type == "REG_MULTI_SZ":
+                        if vk.data_size >= 0x80000000:
+                            # data is stored inline, in the data_offset field itself
+                            multi_sz_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]  # type: ignore[union-attr]
+                        elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
+                            # value is stored in big-data (db) segments
+                            multi_sz_data = self._parse_indirect_block(substream, value)
+                        else:
+                            multi_sz_data = value.value
+                        parsed_value = GreedyRange(CString("utf-16-le")).parse(multi_sz_data)  # type: ignore[union-attr]
+                        # Because the ListContainer object returned by Construct cannot be turned into a list,
+                        # we do this trick
+                        actual_value = [x for x in parsed_value if x]
+                    # We currently dumps this as hex string or raw
+                    # TODO: Add actual parsing
+                    elif data_type in [
+                        "REG_RESOURCE_REQUIREMENTS_LIST",
+                        "REG_RESOURCE_LIST",
+                    ]:
                         actual_value = binascii.b2a_hex(value.value).decode()[:max_len] if trim_values else value.value
-                elif data_type == "REG_SZ":
-                    actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
-                elif data_type == "REG_DWORD":
-                    # If the data size is bigger than 0x80000000, data is actually stored in the VK data offset.
-                    actual_value = vk.data_offset if vk.data_size >= 0x80000000 else Int32ul.parse(value.value)  # type: ignore[union-attr]
-                elif data_type == "REG_QWORD":
-                    actual_value = vk.data_offset if vk.data_size >= 0x80000000 else Int64ul.parse(value.value)  # type: ignore[union-attr]
-                elif data_type == "REG_MULTI_SZ":
-                    if vk.data_size >= 0x80000000:
-                        # data is stored inline, in the data_offset field itself
-                        multi_sz_data = Int32ul.build(vk.data_offset)[: vk.data_size - 0x80000000]  # type: ignore[union-attr]
-                    elif vk.data_size > 0x3FD8 and value.value[:2] == b"db":
-                        # value is stored in big-data (db) segments
-                        multi_sz_data = self._parse_indirect_block(substream, value)
+                    elif data_type == "REG_FILETIME":
+                        actual_value = convert_wintime(Int64ul.parse(value.value), as_json=as_json)  # type: ignore[union-attr]
                     else:
-                        multi_sz_data = value.value
-                    parsed_value = GreedyRange(CString("utf-16-le")).parse(multi_sz_data)  # type: ignore[union-attr]
-                    # Because the ListContainer object returned by Construct cannot be turned into a list,
-                    # we do this trick
-                    actual_value = [x for x in parsed_value if x]
-                # We currently dumps this as hex string or raw
-                # TODO: Add actual parsing
-                elif data_type in [
-                    "REG_RESOURCE_REQUIREMENTS_LIST",
-                    "REG_RESOURCE_LIST",
-                ]:
-                    actual_value = binascii.b2a_hex(value.value).decode()[:max_len] if trim_values else value.value
-                elif data_type == "REG_FILETIME":
-                    actual_value = convert_wintime(Int64ul.parse(value.value), as_json=as_json)  # type: ignore[union-attr]
-                else:
-                    actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
+                        actual_value = try_decode_binary(value.value, as_json=as_json, trim_values=trim_values)
+                except (RegistryParsingException, StreamError, ConstError, UnicodeDecodeError) as ex:
+                    logger.error(f"Bad value {value_name} at {hex(actual_vk_offset)}, marking it as corrupted: {ex}")
+                    yield Value(
+                        name=value_name,
+                        value_type=data_type,
+                        value=None,
+                        is_corrupted=True,
+                    )
+                    continue
                 yield Value(
                     name=value_name,
                     value_type=data_type,

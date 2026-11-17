@@ -3,20 +3,21 @@ import json
 import os
 import struct
 import types
+from contextlib import contextmanager
 from tempfile import mkdtemp, mktemp
 
 import pytest
 
 from regipy import NoRegistrySubkeysException
 from regipy.cli_utils import get_filtered_subkeys
-from regipy.exceptions import RegistryRecoveryException
+from regipy.exceptions import RegistryParsingException, RegistryRecoveryException
 from regipy.hive_types import NTUSER_HIVE_TYPE
 from regipy.plugins.system.external.ShimCacheParser import get_shimcache_entries
 from regipy.plugins.utils import dump_hive_to_json
 from regipy.recovery import _marvin32, _scan_hvle_entries, apply_transaction_logs
 from regipy.regdiff import compare_hives
 from regipy.registry import NKRecord, RegistryHive
-from regipy.structs import HVLE_BLOCK_HEADER_SIZE, REGF_HEADER_SIZE, TRANSACTION_LOG
+from regipy.structs import HVLE_BLOCK_HEADER_SIZE, REGF_HEADER_SIZE, TRANSACTION_LOG, VALUE_KEY
 
 
 def test_parse_header(ntuser_hive):
@@ -290,6 +291,244 @@ def test_parse_indirect_block_output_bounded_by_hive_size():
 
     data = NKRecord._parse_indirect_block(io.BytesIO(file), value)
     assert len(data) == len(file)
+
+
+def test_read_value_data_offset_outside_hive_raises():
+    """
+    A corrupt VK can declare a data offset past the end of the hive. The read must
+    fail with regipy's own parsing exception (so traversal fault-tolerance can
+    consume it), not leak a raw construct StreamError or return garbage.
+    """
+    vk = types.SimpleNamespace(data_size=100, data_offset=0x7FFFFFF0, data_type=3)
+    with pytest.raises(RegistryParsingException, match="points outside of the hive"):
+        NKRecord.read_value(vk, io.BytesIO(b"\x00" * 0x2000))
+
+
+def test_read_value_short_read_raises():
+    """
+    A corrupt VK can declare a data size that overruns the end of the hive. This
+    used to silently return a truncated buffer (a wrong value); it must raise
+    RegistryParsingException instead.
+    """
+    vk = types.SimpleNamespace(data_size=0x5000, data_offset=0x100, data_type=3)
+    with pytest.raises(RegistryParsingException, match="points outside of the hive"):
+        NKRecord.read_value(vk, io.BytesIO(b"\x00" * 0x2000))
+
+
+def test_parse_indirect_block_bad_header_raises():
+    """A truncated "db" header must raise RegistryParsingException, not a raw StreamError."""
+    value = types.SimpleNamespace(value=b"db", size=0x4000)
+    with pytest.raises(RegistryParsingException, match="indirect data block"):
+        NKRecord._parse_indirect_block(io.BytesIO(b"\x00" * 0x2000), value)
+
+
+def test_parse_indirect_block_segment_list_outside_hive_raises():
+    db_cell = b"db" + struct.pack("<HI", 1, 0x7FFFFF00)  # segment list far past EOF
+    value = types.SimpleNamespace(value=db_cell, size=0x4000)
+    with pytest.raises(RegistryParsingException, match="points outside of the hive"):
+        NKRecord._parse_indirect_block(io.BytesIO(b"\x00" * 0x2000), value)
+
+
+def test_parse_indirect_block_segment_outside_hive_raises():
+    """The segment list is inside the hive, but a segment offset points past EOF."""
+    file = bytearray(0x2000)
+    db_cell = b"db" + struct.pack("<HI", 1, 0x100)  # segment list at relative offset 0x100
+    struct.pack_into("<I", file, REGF_HEADER_SIZE + 4 + 0x100, 0x7FFFFF00)
+    value = types.SimpleNamespace(value=db_cell, size=0x4000)
+    with pytest.raises(RegistryParsingException, match="points outside of the hive"):
+        NKRecord._parse_indirect_block(io.BytesIO(bytes(file)), value)
+
+
+def test_parse_indirect_block_truncated_reassembly_raises():
+    """
+    The declared segments do not cover the declared value size. Returning the
+    partial buffer would silently produce a wrong value, so this must raise.
+    """
+    file = bytearray(0x2000)
+    db_cell = b"db" + struct.pack("<HI", 1, 0x100)  # one segment, list at relative 0x100
+    # Segment sits at relative 0xF00, covering only the last 0xFC bytes of the hive
+    struct.pack_into("<I", file, REGF_HEADER_SIZE + 4 + 0x100, 0xF00)
+    value = types.SimpleNamespace(value=db_cell, size=0x2000)
+    with pytest.raises(RegistryParsingException, match="truncated"):
+        NKRecord._parse_indirect_block(io.BytesIO(bytes(file)), value)
+
+
+def _get_vk_file_offset(hive_path, key_path, value_name):
+    """
+    Locate the VK record of a value inside the hive file.
+    :return: (file offset of the VK record, parsed VK struct)
+    """
+    registry_hive = RegistryHive(hive_path)
+    subkey = registry_hive.get_key(key_path)
+    with open(hive_path, "rb") as f:
+        hive_data = f.read()
+    values_list_offset = REGF_HEADER_SIZE + 4 + subkey.header.values_list_offset
+    for i in range(subkey.values_count):
+        (vk_offset,) = struct.unpack_from("<I", hive_data, values_list_offset + 4 * i)
+        vk_file_offset = REGF_HEADER_SIZE + 4 + vk_offset
+        vk = VALUE_KEY.parse_stream(io.BytesIO(hive_data[vk_file_offset:]))
+        if vk.name_size == 0:
+            name = "(default)"
+        elif vk.flags.VALUE_COMP_NAME:
+            name = vk.name.decode("ascii", errors="replace")
+        else:
+            name = vk.name.decode("utf-16-le", errors="replace")
+        if name == value_name:
+            return vk_file_offset, vk
+    raise AssertionError(f"Value {value_name} not found under {key_path}")
+
+
+@contextmanager
+def _corrupted_hive(hive_path, key_path, value_name, new_data_size=None, new_data_offset=None, data_cell_patch=None):
+    """
+    Yield a path to a temp copy of the hive with one value's VK record corrupted:
+    its declared data size and/or data offset patched, and optionally the first
+    bytes of its data cell overwritten.
+    """
+    vk_file_offset, vk = _get_vk_file_offset(hive_path, key_path, value_name)
+    with open(hive_path, "rb") as f:
+        hive_data = bytearray(f.read())
+    if new_data_size is not None:
+        struct.pack_into("<I", hive_data, vk_file_offset + 4, new_data_size)
+    if new_data_offset is not None:
+        struct.pack_into("<I", hive_data, vk_file_offset + 8, new_data_offset)
+    if data_cell_patch is not None:
+        data_cell_offset = REGF_HEADER_SIZE + 4 + vk.data_offset
+        hive_data[data_cell_offset : data_cell_offset + len(data_cell_patch)] = data_cell_patch
+    corrupted_path = mktemp()
+    with open(corrupted_path, "wb") as f:
+        f.write(bytes(hive_data))
+    try:
+        yield corrupted_path
+    finally:
+        os.remove(corrupted_path)
+
+
+def _assert_only_target_value_corrupted(pristine_hive_path, corrupted_hive_path, key_path, value_name):
+    """
+    The two acceptance criteria for a corrupted value: the corrupted value is
+    yielded with is_corrupted=True and carries no (potentially wrong) data, and
+    the iteration of its subkey completes with every other value intact.
+    """
+    pristine_values = {v.name: v for v in RegistryHive(pristine_hive_path).get_key(key_path).iter_values()}
+    corrupted_values = {v.name: v for v in RegistryHive(corrupted_hive_path).get_key(key_path).iter_values()}
+
+    # The corrupted value is still reported, but marked and without data
+    assert corrupted_values[value_name].is_corrupted is True
+    assert corrupted_values[value_name].value is None
+
+    # The subkey traversal completes: every other value is present and identical
+    assert set(corrupted_values) == set(pristine_values)
+    for name, value in corrupted_values.items():
+        if name == value_name:
+            continue
+        assert value.is_corrupted is False
+        assert value.value_type == pristine_values[name].value_type
+        assert value.value == pristine_values[name].value
+
+
+def test_corrupted_dword_value_is_marked(ntuser_hive):
+    """
+    Integer family: a resident REG_DWORD whose VK is corrupted into declaring a
+    2-byte out-of-line buffer. The integer branch used to die on a raw construct
+    StreamError that escaped iter_values entirely; now the value is marked.
+    """
+    key_path, value_name = r"\Console", "ColorTable00"
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_size=2) as corrupted_path:
+        _assert_only_target_value_corrupted(ntuser_hive, corrupted_path, key_path, value_name)
+
+
+def test_corrupted_qword_value_is_marked(ntuser_hive):
+    """Integer family: a non-resident REG_QWORD whose data offset points past EOF."""
+    key_path, value_name = r"\Control Panel\Appearance\New Schemes\0\Sizes\0", "Size #0"
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_offset=0x7FFFFFF0) as corrupted_path:
+        _assert_only_target_value_corrupted(ntuser_hive, corrupted_path, key_path, value_name)
+
+
+def test_value_with_size_overrunning_hive_is_marked(ntuser_hive):
+    """
+    A REG_SZ declaring a data size that overruns the end of the hive used to
+    silently return a truncated (wrong) string; now the value is marked.
+    """
+    key_path, value_name = r"\AppEvents\EventLabels\.Default", "(default)"
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_size=0x7FFFFF00) as corrupted_path:
+        _assert_only_target_value_corrupted(ntuser_hive, corrupted_path, key_path, value_name)
+
+
+def test_corrupted_reg_sz_indirect_block_is_marked(ntuser_hive):
+    """
+    String indirect ("db") block reassembly: the db header's segment list points
+    outside of the hive. The string branch used to let a raw StreamError escape;
+    now the value is marked.
+    """
+    key_path, value_name = r"\AppEvents\EventLabels\.Default", "(default)"
+    db_header = b"db" + struct.pack("<HI", 1, 0x7FFFFF00)
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_size=0x4000, data_cell_patch=db_header) as corrupted_path:
+        _assert_only_target_value_corrupted(ntuser_hive, corrupted_path, key_path, value_name)
+
+
+def test_corrupted_reg_binary_indirect_block_is_marked(ntuser_hive):
+    """
+    Binary indirect ("db") block reassembly: the db header's segment list points
+    outside of the hive. The binary branch used to let a raw StreamError escape
+    (it only caught ConstError); now the value is marked.
+    """
+    key_path, value_name = r"\Control Panel\Appearance\New Schemes\0\Sizes\0", "Font #0"
+    db_header = b"db" + struct.pack("<HI", 1, 0x7FFFFF00)
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_size=0x4000, data_cell_patch=db_header) as corrupted_path:
+        _assert_only_target_value_corrupted(ntuser_hive, corrupted_path, key_path, value_name)
+
+
+def test_unparseable_vk_record_is_skipped(ntuser_hive):
+    """
+    A VK record whose signature is destroyed cannot be parsed at all, so there is
+    no name or type to report: it is skipped explicitly (logged), and the rest of
+    the subkey's values are still iterated.
+    """
+    key_path, value_name = r"\Console", "ColorTable00"
+    vk_file_offset, _ = _get_vk_file_offset(ntuser_hive, key_path, value_name)
+    with open(ntuser_hive, "rb") as f:
+        hive_data = bytearray(f.read())
+    hive_data[vk_file_offset : vk_file_offset + 2] = b"xx"  # destroy the "vk" signature
+    corrupted_path = mktemp()
+    with open(corrupted_path, "wb") as f:
+        f.write(bytes(hive_data))
+    try:
+        pristine_values = {v.name: v for v in RegistryHive(ntuser_hive).get_key(key_path).iter_values()}
+        corrupted_values = {v.name: v for v in RegistryHive(corrupted_path).get_key(key_path).iter_values()}
+    finally:
+        os.remove(corrupted_path)
+
+    # The unparseable value is gone, every other value survived intact
+    assert value_name not in corrupted_values
+    assert set(corrupted_values) == set(pristine_values) - {value_name}
+    for name, value in corrupted_values.items():
+        assert value.is_corrupted is False
+        assert value.value == pristine_values[name].value
+
+
+def test_recurse_subkeys_completes_with_corrupted_value(ntuser_hive):
+    """
+    End-to-end: a corrupted value must not poison recurse_subkeys. The whole tree
+    is walked, the corrupted value is marked, and its sibling values are intact.
+    """
+    key_path, value_name = r"\Console", "ColorTable00"
+    with _corrupted_hive(ntuser_hive, key_path, value_name, new_data_size=2) as corrupted_path:
+        corrupted_entries = {e.path: e for e in RegistryHive(corrupted_path).recurse_subkeys()}
+        pristine_entries = {e.path: e for e in RegistryHive(ntuser_hive).recurse_subkeys()}
+
+    # The entire tree was traversed
+    assert set(corrupted_entries) == set(pristine_entries)
+
+    corrupted_values = {v.name: v for v in corrupted_entries["\\Console"].values}
+    pristine_values = {v.name: v for v in pristine_entries["\\Console"].values}
+    assert corrupted_values[value_name].is_corrupted is True
+    assert corrupted_values[value_name].value is None
+    assert set(corrupted_values) == set(pristine_values)
+    for name, value in corrupted_values.items():
+        if name == value_name:
+            continue
+        assert value.value == pristine_values[name].value
 
 
 def _build_hvle_log(sequence_number, hive_bin_size, dirty_pages, log_size=None):
